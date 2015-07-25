@@ -55,7 +55,8 @@ env.roledefs.update(
 )
 
 @roles('gate')
-def update_doaj(branch='production', tag="", doajdir=DOAJ_PROD_PATH_SRC):
+def update_doaj(branch='production', tag="", doajdir=DOAJ_PROD_PATH_SRC, deploy_script='production_doaj_deploy-gateway.sh'):
+
     if not tag and branch == 'production':
         print 'Please specify a tag to deploy to production'
         sys.exit(1)
@@ -76,13 +77,7 @@ def update_doaj(branch='production', tag="", doajdir=DOAJ_PROD_PATH_SRC):
         if tag:
             run('git checkout {0}'.format(tag))
         run('git submodule update --init', pty=False)
-        run('deploy/{0}_doaj_deploy-gateway.sh'.format(branch))
-
-@roles('staging')
-def update_staging(branch='production'):
-    '''Update the staging server with the latest live code and reload the app.'''
-    execute(update_doaj, branch=branch, hosts=env.roledefs['staging'])
-    execute(reload_staging)
+        run('deploy/' + deploy_script)
 
 @roles('staging')
 def reload_staging():
@@ -115,12 +110,6 @@ def pull_xml_uploads():
         pty=False
     )
 
-def sync_suggestions(from_, to_):
-    FROM, source_host, TO, target_host = _get_hosts(from_, to_)
-    execute(_sync_suggestions, FROM=FROM, hosts=[target_host])
-    execute(count_suggestions, hosts=[source_host, target_host])
-    raw_input('Suggestion counts OK? Press <Enter>. If not, press Ctrl+C to terminate now.')
-
 @roles('app')
 def check_doaj_running():
     run('if [ $(curl -s localhost:{app_port}| grep {check_for} | wc -l) -ge 1 ]; then echo "DOAJ running on localhost:{app_port}"; fi'
@@ -147,8 +136,13 @@ def deploy_live(branch='production', tag=""):
     execute(reload_webserver, hosts=env.roledefs['app'])
 
 @roles('gate')
+def deploy_staging(branch='production', tag=""):
+    update_doaj(branch=branch, tag=tag, doajdir=DOAJ_TEST_PATH_SRC, deploy_script='deploy/production_doaj_deploy-gateway.sh')
+    execute(reload_webserver(supervisor_doaj_task_name='doaj-test'), hosts=env.roledefs['test'])
+
+@roles('gate')
 def deploy_test(branch='develop', tag=""):
-    update_doaj(branch=branch, tag=tag, doajdir=DOAJ_TEST_PATH_SRC)
+    update_doaj(branch=branch, tag=tag, doajdir=DOAJ_TEST_PATH_SRC, deploy_script='test_doaj_deploy-gateway.sh')
     execute(reload_webserver(supervisor_doaj_task_name='doaj-test'), hosts=env.roledefs['test'])
 
 @roles('gate')
@@ -156,9 +150,10 @@ def create_staging(tag):
     if _find_staging_server(STAGING_DO_NAME):
         print "The staging server already exists. Destroy it with destroy_staging task first if you want, then rerun this."
         sys.exit(1)
-    ip = _create_staging_server(STAGING_DO_NAME)
-    execute(_setup_staging_server, hosts=[ip])
-    print 'Staging server set up complete. SSH into {0}'.format(ip)
+    public_ip, private_ip = _create_staging_server(STAGING_DO_NAME)
+    execute(_setup_gate_for_staging(private_ip), hosts=[DOAJGATE_IP])
+    execute(_setup_staging_server, hosts=[public_ip])
+    print 'Staging server set up complete. SSH into {0}'.format(public_ip)
 
 def destroy_staging():
     staging = _find_staging_server(STAGING_DO_NAME)
@@ -196,6 +191,9 @@ def _find_staging_server(do_name):
             return d
     return None
 
+def _setup_gate_for_staging(staging_private_ip):
+    run('echo {0} > ~/repl/ips/staging'.format(staging_private_ip))
+
 def _create_staging_server(do_name):
     token, digitalocean = _setup_ocean_get_token()
     manager = digitalocean.Manager(token=token)
@@ -206,7 +204,8 @@ def _create_staging_server(do_name):
        image='11434212',  # basic-server-15-Apr-2015-2GB
        size_slug='2gb',  # 2GB ram, 2 VCPUs, 40GB SSD
        backups=False,
-       private_networking=True
+       private_networking=True,
+       ssh_keys=['0a:f2:67:2c:d3:65:00:3d:70:7f:8e:e1:9a:8a:2c:7b', '81:54:2b:e7:dd:99:d5:89:c6:a6:cb:25:10:df:df:0b', '53:28:cc:e8:6c:28:aa:a4:67:5e:06:b2:64:b3:7e:ae', '20:91:2f:e3:a0:ba:9f:e3:30:ac:39:f3:8c:fb:11:a3', '33:b8:aa:6c:90:c3:f4:0f:4f:d0:2b:37:05:0e:8f:b4', 'bf:e2:5d:18:f5:ed:38:a1:59:b1:81:1e:0c:46:7c:54']
     )
     droplet.create()
     
@@ -216,7 +215,24 @@ def _create_staging_server(do_name):
         droplet = manager.get_droplet(droplet.id)
 
     print 'Staging droplet created, public IP {0}'.format(droplet.ip_address)
-    return droplet.ip_address
+    return droplet.ip_address, droplet.private_ip_address
 
 def _setup_staging_server():
-    run('echo "test" > ~/check.txt')
+    run('cd /opt/sysadmin')
+    run('git config user.email "us@cottagelabs.com"')
+    run('git config user.name "Cottage Labs LLP"')
+    run('git pull')
+    run('cp /opt/sysadmin/doaj/staging/authorized_keys ~/.ssh/authorized_keys')
+
+    run('wget https://download.elastic.co/elasticsearch/elasticsearch/elasticsearch-1.4.4.deb')
+    sudo('dpkg -i elasticsearch-1.4.4.deb')
+    sudo('update-rc.d elasticsearch defaults 95 10')
+
+    # make sure nginx (incl doaj-gate!) is correct, and supervisor (run through request to staging in head)
+    # finish going through doajtest's command history
+    # push hotfix with all new files
+
+def __load(filename):
+    with open(filename, 'rb') as f:
+        content = f.read()
+    return content
